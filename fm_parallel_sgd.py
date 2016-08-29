@@ -31,7 +31,7 @@ def get_phi(X, V0, V, W):
     phi = V0 + VX + 0.5*(WX*WX - WX_square).sum()
     return phi
 
-def fm_get_p(x, v0, v, w):
+def fm_get_p_spark(x, v0, v, w):
     """
     Computes the probability of an instance given a model
     """
@@ -56,6 +56,7 @@ def fm_get_p(x, v0, v, w):
     phi =V0X + VX + 0.5*(WX*WX - WX_square).sum()
 
     return 1.0/(1.0 + np.exp(-phi))
+
 
 def fm_get_p_pandasDF(x, v0, v, w):
     """
@@ -103,23 +104,9 @@ def fm_gradient_sgd_trick(X, y, V0, V, W, regParam):
     expnyt = np.exp(-y * phi)
     fac = (-y * expnyt) / (1 + expnyt)
     ret = (regParam * V0 + fac * DV0, regParam * V + fac * DV, regParam * W + fac * (DW1 - DW2))
-    # print "input:"
-    # print X
-    # print V0
-    # print V
-    # print W
-    # print "output:"
-    # print VX
-    # print DV
-    # print phi
-    # print expnyt
-    # print fac
-    # print ret
-
+    # print "input:", # print X, # print V0, # print V, # print W, # print "output:",
+    # print VX, # print DV, # print phi, # print expnyt, # print fac, # print ret,
     return ret
-
-
-
 
 def fm_gradient_sgd(X, y, dim, V, W, regParam):
     """
@@ -135,12 +122,6 @@ def fm_gradient_sgd(X, y, dim, V, W, regParam):
     x_matrix_negeye = (1-np.eye(dim))*x_matrix
     return regParam*W + (-y*expnyt)/(1+expnyt)* (np.dot(x_matrix_negeye, W))
 
-
-def predictFM(data, v0, v, w) :
-    """
-    Computes the probabilities given a model for the complete data set
-    """
-    return data.map(lambda row: fm_get_p(row.features, v0, v, w))
 
 
 
@@ -165,6 +146,114 @@ def logloss2(y_pred, y_true) :
     
     losses =  -y_true * np.log(y_pred) - (1-y_true)*np.log(1-y_pred)
     return np.mean(losses)
+
+def convert_rddLabelPoint_pandasDF(data, feat_list):
+    '''
+    create from rdd of LabelPoint
+    first columns must be label='isclk'
+    :param data:
+    :param feat_list:
+    :return:
+    '''
+    # data is labeledPoint RDD
+    train_Y_1d = np.array(data.map(lambda row: row.label).collect())
+    (cnt,) = train_Y_1d.shape
+    train_Y = train_Y_1d.reshape(cnt, 1)
+    # for dense vector only
+    first_rec_features = data.take(1)[0]
+
+    if type(first_rec_features.features)==pyspark.mllib.linalg.DenseVector:
+        train_X = np.array(data.map(lambda row: row.features).collect())
+    elif type(first_rec_features.features)==pyspark.mllib.linalg.SparseVector:
+        train_X = np.array(data.map(lambda row: row.features.toArray()).collect())
+    data_arr = np.concatenate((train_Y, train_X), axis=1)
+    return pd.DataFrame( data=data_arr, columns=['isclk']+feat_list )
+
+
+def trainFM_sgd_pandasDF(df, iterations=2, alpha=0.01, regParam=0.01, factorLength=4) :
+    """
+    Train a Factorization Machine model using stochastic gradient descent, non-parallel.
+
+    Parameters:
+    data : RDD of LabeledPoints
+            Training data. Labels should be -1 and 1
+
+    #### train_X, and train_Y are np.array #####
+
+    iterations : numeric
+            Nr of iterations of SGD. default=300
+    alpha : numeric
+            Learning rate of SGD. default=0.01
+    regParam : numeric
+            Regularization parameter. default=0.01
+    factorLength : numeric
+            Length of the weight vectors of the FMs. default=4
+
+    returns: w
+            numpy matrix holding the model weights
+    """
+    train_Y = df['isclk'].as_matrix()
+    train_X_df = df.ix[:, 1:]
+    feat_list = train_X_df.columns.values
+    train_X = train_X_df.as_matrix()
+
+    # (row.feartures).collect =>
+    (N, dim) = train_X.shape
+    v0 = np.random.ranf()
+    v = np.random.ranf(dim)
+    v = v / np.sqrt((v*v).sum())
+    w = np.random.ranf((dim, factorLength))
+    w = w / np.sqrt((w*w).sum())
+    m = [v0, v, w]
+    G = [1, np.ones(v.shape), np.ones(w.shape)]
+    for i in xrange(iterations):
+
+        np.random.seed(int(time.time()))
+        random_idx_list = np.random.permutation(N)
+        for j in xrange(N):
+            idx = random_idx_list[j]
+            X = train_X[idx] # array of (p,)
+            y = train_Y[idx]
+            #grads = fm_gradient_sgd_trick(X, y, wsub, regParam)
+
+            v0, v, w = m
+            grads = fm_gradient_sgd_trick(X, y, v0, v, w, regParam)
+            grads_sq = [cp*cp for cp in grads]
+            G = [G[jj] + grads_sq[jj] for jj in range(3)]
+
+            #print G
+            m = [ m[jj]-alpha*grads[jj]/np.sqrt(G[jj]) for jj in range(3)]
+            #G += grads * grads
+            #w -= alpha * grads / np.sqrt(G) # AdaGrad
+        print "iter=%d" % i
+        print m
+
+    return list(feat_list), m
+
+def predict_pdDF(data, feat_list, m):
+    '''
+    data only has X
+    check if data consistent with feat_list
+    re-order columns in data
+    :param data:
+    :param feat_list:
+    :param m:
+    :return:
+    '''
+    data_feat_list = set(list(data.columns.values))
+    ex_feat_list = set(feat_list)
+    if not (len(data_feat_list - ex_feat_list)==0 and len(ex_feat_list - data_feat_list)==0):
+        return
+
+    md = m[1]
+    data_arr = data[feat_list].as_matrix()
+    (nrow, ncol) = data_arr.shape
+    ret = np.zeros(nrow)
+    for i in xrange(nrow):
+        ret[i] = fm_get_p_pandasDF(data_arr[i], md[0], md[1], md[2])
+    return ret
+
+
 
 
 #-----------------------------------------------------------------------
@@ -376,7 +465,7 @@ def sgd_subset_sparse(train_X, train_Y, w, iter_sgd, alpha, regParam) :
  
     return wsub
 
-def trainFM_sgd (data, iterations=2, alpha=0.01, regParam=0.01, factorLength=4) :
+def trainFM_sgd(data, iterations=2, alpha=0.01, regParam=0.01, factorLength=4) :
     """
     Train a Factorization Machine model using stochastic gradient descent, non-parallel.
 
@@ -433,117 +522,12 @@ def trainFM_sgd (data, iterations=2, alpha=0.01, regParam=0.01, factorLength=4) 
 
     return m
 
-def convert_rddLabelPoint_pandasDF(data, feat_list):
-    '''
-    create from rdd of LabelPoint
-    first columns must be label='isclk'
-    :param data:
-    :param feat_list:
-    :return:
-    '''
-    # data is labeledPoint RDD
-    train_Y_1d = np.array(data.map(lambda row: row.label).collect())
-    (cnt,) = train_Y_1d.shape
-    train_Y = train_Y_1d.reshape(cnt, 1)
-    # for dense vector only
-    first_rec_features = data.take(1)[0]
 
-    if type(first_rec_features.features)==pyspark.mllib.linalg.DenseVector:
-        train_X = np.array(data.map(lambda row: row.features).collect())
-    elif type(first_rec_features.features)==pyspark.mllib.linalg.SparseVector:
-        train_X = np.array(data.map(lambda row: row.features.toArray()).collect())
-    data_arr = np.concatenate((train_Y, train_X), axis=1)
-    return pd.DataFrame( data=data_arr, columns=['isclk']+feat_list )
-
-
-def trainFM_sgd_pandasDF(df, iterations=2, alpha=0.01, regParam=0.01, factorLength=4) :
+def predictFM(data, v0, v, w) :
     """
-    Train a Factorization Machine model using stochastic gradient descent, non-parallel.
-
-    Parameters:
-    data : RDD of LabeledPoints
-            Training data. Labels should be -1 and 1
-
-    #### train_X, and train_Y are np.array #####
-
-    iterations : numeric
-            Nr of iterations of SGD. default=300
-    alpha : numeric
-            Learning rate of SGD. default=0.01
-    regParam : numeric
-            Regularization parameter. default=0.01
-    factorLength : numeric
-            Length of the weight vectors of the FMs. default=4
-
-    returns: w
-            numpy matrix holding the model weights
+    Computes the probabilities given a model for the complete data set
     """
-    train_Y = df['isclk'].as_matrix()
-    train_X_df = df.ix[:, 1:]
-    feat_list = train_X_df.columns.values
-    train_X = train_X_df.as_matrix()
-
-    # (row.feartures).collect =>
-    (N, dim) = train_X.shape
-    v0 = np.random.ranf()
-    v = np.random.ranf(dim)
-    v = v / np.sqrt((v*v).sum())
-    w = np.random.ranf((dim, factorLength))
-    w = w / np.sqrt((w*w).sum())
-    m = [v0, v, w]
-    G = [1, np.ones(v.shape), np.ones(w.shape)]
-    for i in xrange(iterations):
-
-        np.random.seed(int(time.time()))
-        random_idx_list = np.random.permutation(N)
-        for j in xrange(N):
-            idx = random_idx_list[j]
-            X = train_X[idx] # array of (p,)
-            y = train_Y[idx]
-            #grads = fm_gradient_sgd_trick(X, y, wsub, regParam)
-
-            v0, v, w = m
-            grads = fm_gradient_sgd_trick(X, y, v0, v, w, regParam)
-            grads_sq = [cp*cp for cp in grads]
-            G = [G[jj] + grads_sq[jj] for jj in range(3)]
-
-            #print G
-            m = [ m[jj]-alpha*grads[jj]/np.sqrt(G[jj]) for jj in range(3)]
-            #G += grads * grads
-            #w -= alpha * grads / np.sqrt(G) # AdaGrad
-        print "iter=%d" % i
-        print m
-
-    return list(feat_list), m
-
-def predict_pdDF(data, feat_list, m):
-    '''
-    data only has X
-    check if data consistent with feat_list
-    re-order columns in data
-    :param data:
-    :param feat_list:
-    :param m:
-    :return:
-    '''
-    data_feat_list = set(list(data.columns.values))
-    ex_feat_list = set(feat_list)
-    if not (len(data_feat_list - ex_feat_list)==0 and len(ex_feat_list - data_feat_list)==0):
-        return
-
-    md = m[1]
-    data_arr = data[feat_list].as_matrix()
-    (nrow, ncol) = data_arr.shape
-    ret = np.zeros(nrow)
-    for i in xrange(nrow):
-        ret[i] = fm_get_p_pandasDF(data_arr[i], md[0], md[1], md[2])
-    return ret
-
-
-
-
-
-
+    return data.map(lambda row: fm_get_p_spark(row.features, v0, v, w))
 
 
 #-----------------------------------------------------------------------
